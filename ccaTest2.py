@@ -1,19 +1,143 @@
-import socket
+import pjsua2 as pj
 import wave
 import time
 import os
-import json
 import concurrent.futures
 from datetime import datetime
+import json
+
+class MyLogWriter(pj.LogWriter):
+    def write(self, entry):
+        print(f"Log: {entry}")
 
 
-# Define the server address and ports
-UDP_IP = "localhost"
-RTP_PORT = 5059  # RTP streaming port
-SIP_PORT = 5059  # SIP signaling port
+class MyCall(pj.Call):
+    def __init__(self, acc, call_id=None):
+        super().__init__(acc, call_id)
+        self.account = acc
+        self.rtp_streaming = False
+
+    def onCallState(self, prm):
+        call_info = self.getInfo()
+        print(f"Call {call_info.remoteUri} state: {call_info.stateText}")
+        if call_info.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            print(f"Call confirmed with {call_info.remoteUri}")
+            self.start_rtp()
+
+        elif call_info.state == pj.PJSIP_INV_STATE_DISCONNECTED:
+            print(f"Call disconnected with {call_info.remoteUri}")
+            self.stop_rtp()
+
+    def onCallMediaState(self, prm):
+        call_info = self.getInfo()
+        if call_info.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            print("Media state confirmed")
+
+    def start_rtp(self):
+        self.rtp_streaming = True
+        print("RTP streaming started")
+
+    def stop_rtp(self):
+        self.rtp_streaming = False
+        print("RTP streaming stopped")
 
 
-# Load SIP signals from JSON file
+class MyAccount(pj.Account):
+    def onRegState(self, prm):
+        print(f"Registration status: {prm.code} - {prm.reason}")
+
+    def create_call(self, target_uri):
+        call = MyCall(self)
+        call_prm = pj.CallOpParam()
+        call.makeCall(target_uri, call_prm)
+        return call
+
+# Initialize pjsua2
+def initialize_pjsua2():
+    ep = pj.Endpoint()
+    ep.libCreate()
+
+    # Configure logging
+    log_cfg = pj.LogConfig()
+    log_cfg.consoleLevel = 4  # Set log level (0-5, where 5 is the most verbose)
+    log_cfg.writer = MyLogWriter()  # Ensure writer is an instance of LogWriter
+
+    # Configure the endpoint
+    ep_cfg = pj.EpConfig()
+    ep_cfg.logConfig = log_cfg
+
+    # Initialize the library with the configuration
+    ep.libInit(ep_cfg)
+
+    # Create a UDP transport for SIP
+    transport_cfg = pj.TransportConfig()
+    transport_cfg.port = 5070  # Local SIP signaling port
+    ep.transportCreate(pj.PJSIP_TRANSPORT_UDP, transport_cfg)
+
+    # Start the PJSUA2 library
+    ep.libStart()
+    print("SIP service started on localhost, ready to send and receive SIP messages.")
+    return ep
+
+
+def setup_account(ep, username, password, proxy):
+    account_cfg = pj.AccountConfig()
+    account_cfg.idUri = f"sip:{username}@{proxy}"
+    account_cfg.regConfig.registerOnAdd = False
+
+    cred = pj.AuthCredInfo("digest", "*", username, 0, password)
+    account_cfg.sipConfig.authCreds.append(cred)
+    account_cfg.sipConfig.proxies.append(f"sip:{proxy}")
+
+    acc = MyAccount()
+    acc.create(account_cfg)
+    return acc
+
+
+def stream_audio(call, audio_file):
+    try:
+        with wave.open(audio_file, 'rb') as wf:
+            frame_rate = wf.getframerate()
+            chunk_size = 16384
+
+            while True:
+                if not call.rtp_streaming:
+                    break
+                data = wf.readframes(chunk_size)
+                if not data:
+                    break
+                time.sleep(chunk_size / frame_rate)
+    except Exception as e:
+        print(f"Error streaming audio: {e}")
+
+
+def process_sip_signals(ep, acc, sip_signals):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
+        for folder_path, sip_signal_list in sip_signals.items():
+            audio_files = [f for f in os.listdir(folder_path) if f.endswith('.wav')]
+            for index, audio_file in enumerate(audio_files):
+                audio_file_path = os.path.join(folder_path, audio_file)
+                sip_uri = sip_signal_list[index % len(sip_signal_list)]
+                futures.append(executor.submit(handle_call, acc, sip_uri, audio_file_path))
+
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+
+
+def handle_call(acc, target_uri, audio_file):
+    print(f"Initiating call to {target_uri} with audio file {audio_file}")
+    call = acc.create_call(target_uri)
+    time.sleep(2)  # Allow time for the call to connect
+
+    if call.rtp_streaming:
+        stream_audio(call, audio_file)
+
+    # End the call
+    call.hangup(pj.CallOpParam())
+    print(f"Call to {target_uri} completed")
+
+
 def load_sip_signals(json_file):
     try:
         with open(json_file, 'r') as f:
@@ -23,108 +147,25 @@ def load_sip_signals(json_file):
         return {}
 
 
-# Send SIP INVITE and wait for 200 OK
-def send_sip_invite_and_wait_for_ok(ip, port, sip_invite):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(5)  # Timeout for waiting for 200 OK
-
-    invite_timestamp = datetime.now()
-    sock.sendto(sip_invite.encode(), (ip, port))
-    print(f"Sent SIP INVITE at {invite_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} to {ip}:{port}")
-
-    try:
-        data, addr = sock.recvfrom(4096)  # Buffer size is 4096 bytes for SIP signaling
-        ok_timestamp = datetime.now()
-        duration_ms = (ok_timestamp - invite_timestamp).total_seconds() * 1000
-
-        if data.startswith(b"SIP/2.0 200 OK"):
-            print("\n\nSIP INVITE APPROVED, RECEIVED SIGNAL AS BELOW - \n", data.decode(), "\n\n")
-            print(f"Received 200 OK from {addr} at {ok_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-            print(f"Duration to receive 200 OK: {duration_ms:.2f} ms")
-            return True
-        else:
-            print("Unexpected response:", data.decode())
-            return False
-    except socket.timeout:
-        print("Timeout waiting for 200 OK")
-        return False
-
-
-# Direct the audio file to the UDP port
-def send_audio_file(ip, port, audio_file):
-    try:
-        # Create a UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        # Open the audio file
-        with wave.open(audio_file, 'rb') as wf:
-            # Get audio file parameters
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            frame_rate = wf.getframerate()
-            n_frames = wf.getnframes()
-            print(f"\nAudio file parameters: channels={channels}, sample_width={sample_width}, frame_rate={frame_rate}, n_frames={n_frames}")
-
-            # Read and send audio data
-            chunk_size = 16384
-            while True:
-                data = wf.readframes(chunk_size)
-                if not data:
-                    break
-                sock.sendto(data, (ip, port))
-                time.sleep(chunk_size / frame_rate)
-
-        sock.close()
-    except Exception as e:
-        print(f"Error sending audio file {audio_file}: {e}")
-
-
-# Stream SIP signal and audio concurrently for each entry
-def stream_signal_and_audio(path, sip_signal):
-    print(f"---------------------------------------------------------------------------------------------------------")
-    print(f"Attempting to stream audio file: {path}")
-
-    if send_sip_invite_and_wait_for_ok(UDP_IP, SIP_PORT, sip_signal):
-        send_audio_file(UDP_IP, RTP_PORT, path)
-        print(f"\nFile stream complete for {path}")
-    else:
-        print("Failed to receive 200 OK, skipping audio streaming")
-
 def main():
-    json_file = "/home/aiadmin/hsbc-cca/SIPjson.json"
+    json_file = "/home/aiadmin/yuck/SIPjson.json"
     sip_signals = load_sip_signals(json_file)
 
     if not sip_signals:
         print("No SIP signals found. Please check the JSON file.")
         return
 
-    # Create a thread pool for concurrent processing
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for folder_path, sip_signal_list in sip_signals.items():
-            folder_path = folder_path.strip()  # Remove leading and trailing whitespace
-            print(f"Checking folder path: '{folder_path}'")  # Debugging output
+    ep = initialize_pjsua2()
+    acc = setup_account(ep, "user", "password", "proxy.domain")
 
-            try:
-                audio_files = [f for f in os.listdir(folder_path) if f.endswith('.wav')]
-                for index, audio_file in enumerate(audio_files):
-                    audio_file_path = os.path.join(folder_path, audio_file)
-                    print(f"Checking audio file at path: {audio_file_path}")
+    try:
+        process_sip_signals(ep, acc, sip_signals)
+    finally:
+        acc.delete()
+        ep.libDestroy()
 
-                    if os.path.isfile(audio_file_path):
-                        # Use the SIP signal at the current index, cycling if necessary
-                        sip_signal = sip_signal_list[index % len(sip_signal_list)]
-                        futures.append(executor.submit(stream_signal_and_audio, audio_file_path, sip_signal))
-                    else:
-                        print(f"Audio file does not exist or is not a .wav file: {audio_file_path}")
-            except FileNotFoundError as e:
-                print(f"Error: {e}")
+    print("All calls processed successfully")
 
-        # Wait for all futures to complete
-        for future in concurrent.futures.as_completed(futures):
-            future.result()  # Get the result to raise exceptions if any occurred
-
-    print("All files streamed successfully")
 
 if __name__ == "__main__":
     main()
